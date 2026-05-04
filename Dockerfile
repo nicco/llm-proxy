@@ -4,8 +4,14 @@ WORKDIR /app
 
 RUN apk add --no-cache musl-dev
 
-# Copy everything and build
-COPY . .
+# Cache dependency compilation layer
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs
+RUN cargo build --release 2>/dev/null; true
+RUN rm -rf src
+
+# Build the actual binary
+COPY src/ src/
 RUN cargo build --release && \
     cp target/release/llm-proxy /llm-proxy
 

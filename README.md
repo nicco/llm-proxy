@@ -165,4 +165,4 @@ upstream (vLLM, etc.) :8000
 
 ## License
 
-Same as your project's.
+[MIT](LICENSE)

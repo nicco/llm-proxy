@@ -9,12 +9,14 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 struct AppState {
     config: config::AppConfig,
+    client: Client<HttpConnector, axum::body::Body>,
+    max_body: usize,
 }
 
 /// Catch-all: extract model from URL prefix or request body JSON.
@@ -32,13 +34,11 @@ async fn handle(
         .next()
         .filter(|s| !s.is_empty());
 
-    // Check if first segment is a known model
     let model_name = if let Some(seg) = first_seg {
         if state.config.find(seg).is_some() {
             seg.to_string()
         } else {
-            // First segment isn't a model — try from body
-            return infer_model_from_body(&state, path, req, &uri).await;
+            return infer_model_from_body(&state, path, req).await;
         }
     } else {
         return Err((StatusCode::BAD_REQUEST, "missing model name".to_string()));
@@ -52,9 +52,8 @@ async fn handle(
     let remaining = &path[model_name.len() + 1..];
     let upstream_url = format!("{}{}", model_cfg.target.trim_end_matches('/'), remaining);
 
-    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
     let method = req.method().clone();
-    forward::proxy(&upstream_url, model_cfg, req, &client, method)
+    forward::proxy(&upstream_url, model_cfg, req, &state.client, method)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
@@ -78,14 +77,12 @@ async fn infer_model_from_body(
     state: &AppState,
     path: &str,
     req: Request<axum::body::Body>,
-    _uri: &Uri,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     let (parts, body) = req.into_parts();
-    let body_bytes = axum::body::to_bytes(body, 4 * 1024 * 1024)
+    let body_bytes = axum::body::to_bytes(body, state.max_body)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // Extract model from JSON body
     let model_name = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
         .and_then(|v| v.get("model")?.as_str().map(|s| s.to_string()))
@@ -96,7 +93,7 @@ async fn infer_model_from_body(
         .find(&model_name)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown model: {model_name}")))?;
 
-    // Reconstruct request with original body
+    let method = parts.method.clone();
     let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
     let upstream_url = format!(
@@ -105,29 +102,28 @@ async fn infer_model_from_body(
         path
     );
 
-    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
-    let method = req.method().clone();
-    forward::proxy(&upstream_url, model_cfg, req, &client, method)
+    forward::proxy(&upstream_url, model_cfg, req, &state.client, method)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
 /// Fetch vLLM model list and return only proxy-configured models that match.
 async fn list_models(State(state): State<Arc<AppState>>) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    // Fetch upstream model list from first configured target
     let target = state.config.models.first().map(|m| &m.target).cloned().unwrap_or_default();
     let upstream_url = format!("{}/models", target.trim_end_matches('/'));
 
-    let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
     let req = Request::builder()
         .uri(&upstream_url)
         .body(axum::body::Body::empty())
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    let resp = client
-        .request(req)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let resp = match state.client.request(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("upstream /v1/models failed: {e}");
+            return Err((StatusCode::BAD_GATEWAY, format!("upstream models fetch failed: {e}")));
+        }
+    };
 
     let collected = resp.into_body().collect().await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
@@ -179,9 +175,26 @@ async fn main() -> anyhow::Result<()> {
         &config::AppConfig::default_path().to_string_lossy(),
     )?;
 
-    let state = Arc::new(AppState { config });
+    if config.models.is_empty() {
+        tracing::warn!("config loaded with zero models — all requests will 404");
+    } else {
+        tracing::info!("loaded {} model(s)", config.models.len());
+    }
 
-    let addr: std::net::SocketAddr = "0.0.0.0:7878".parse()?;
+    let max_body: usize = std::env::var("LLM_PROXY_MAX_BODY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4 * 1024 * 1024); // 4 MiB default
+
+    let client: Client<HttpConnector, axum::body::Body> =
+        Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+
+    let state = Arc::new(AppState { config, client, max_body });
+
+    let bind: std::net::SocketAddr = std::env::var("LLM_PROXY_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:7878".into())
+        .parse()
+        .expect("invalid LLM_PROXY_BIND address");
 
     let cors = CorsLayer::new()
         .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
@@ -195,9 +208,14 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("listening on {addr}");
-    axum::serve(listener, app).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("listening on {bind}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("shutting down");
+        })
+        .await?;
 
     Ok(())
 }

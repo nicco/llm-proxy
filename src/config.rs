@@ -19,7 +19,6 @@ pub struct ModelConfig {
     pub name: String,
     pub target: String,
     pub served_model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Arbitrary key-value pairs injected into the request body as-is.
     /// The proxy does not interpret these fields.
