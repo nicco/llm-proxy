@@ -35,7 +35,12 @@ impl AppConfig {
         if let Ok(p) = env::var("LLM_PROXY_CONFIG") {
             return PathBuf::from(p);
         }
-        let home = env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
+        let home = env::var("HOME").unwrap_or_else(|_| {
+            // If HOME isn't set and neither is LLM_PROXY_CONFIG, fail with a clear message
+            eprintln!("error: HOME not set and LLM_PROXY_CONFIG not set");
+            eprintln!("  Set LLM_PROXY_CONFIG=/path/to/config.json or export HOME=<your-home>");
+            std::process::exit(1);
+        });
         PathBuf::from(home).join(".llm-proxy").join("config.json")
     }
 
