@@ -1,0 +1,11 @@
+services:
+  llm-proxy:
+    build: .
+    container_name: llm-proxy
+    ports:
+      - "27878:7878"
+    volumes:
+      - ./config:/root/.llm-proxy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
