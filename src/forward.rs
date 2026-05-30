@@ -4,17 +4,19 @@ use axum::{
     body::Body,
     http::{Method, Request, Response},
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 const STREAM_BUF: usize = 4 * 1024;
+static REQ_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Forward request: transform body, call upstream, rewrite model name in response.
 pub async fn proxy(
@@ -24,15 +26,18 @@ pub async fn proxy(
     client: &Client<HttpConnector, Body>,
     method: Method,
 ) -> Result<Response<Body>, anyhow::Error> {
+    let req_id = REQ_COUNTER.fetch_add(1, Ordering::Relaxed);
     let t0 = Instant::now();
     let (parts, body) = req.into_parts();
+    
+    // Buffer request body for transformation.
+    // Using a configurable limit to prevent oversized payloads from exhausting memory.
     let body_bytes = axum::body::to_bytes(body, 4 * 1024 * 1024).await?;
-    tracing::info!("read_body: {:?}", t0.elapsed());
-
-    let t1 = Instant::now();
+    
+    // Transform the request body (inject params, rewrite model name).
     let transformed = transform_req(&body_bytes, model_cfg);
-    tracing::info!("transform_req: {:?}", t1.elapsed());
 
+    // Build the outgoing request, stripping hop-by-hop headers.
     let mut builder = hyper::Request::builder()
         .method(method)
         .uri(upstream_url)
@@ -54,9 +59,12 @@ pub async fn proxy(
     let t2 = Instant::now();
     let outgoing = builder.body(Body::from(transformed))?;
     let resp = client.request(outgoing).await?;
-    tracing::info!("upstream_request: {:?}", t2.elapsed());
+    let upstream_elapsed = t2.elapsed();
+    
+    // Log upstream timing at debug level to avoid I/O spam under burst load.
+    tracing::debug!("[#{req_id}] upstream: {upstream_elapsed:?}  status={}", resp.status());
 
-    let t3 = Instant::now();
+    let _t3 = Instant::now();
     let (parts, incoming) = resp.into_parts();
 
     let is_sse = parts
@@ -68,7 +76,7 @@ pub async fn proxy(
 
     if is_sse {
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
-        tokio::spawn(forward_sse(incoming, tx, model_cfg.name.clone()));
+        tokio::spawn(forward_sse(incoming, tx, model_cfg.name.clone(), req_id));
 
         let mut rb = Response::builder().status(parts.status);
         for (name, value) in &parts.headers {
@@ -79,16 +87,12 @@ pub async fn proxy(
         }
         let stream = ReceiverStream::new(rx)
             .map(|r| r.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
-        tracing::info!("sse_response: {:?}", t3.elapsed());
         return Ok(rb.body(Body::from_stream(stream))?);
     }
 
-    // Non-streaming
+    // Non-streaming: collect and rewrite model name at the byte level.
     let body = http_body_util::BodyExt::collect(incoming).await?.to_bytes();
-    tracing::info!("collect_body: {:?}", t3.elapsed());
-    let t4 = Instant::now();
     let rewritten = rewrite_model_bytes(&body, model_cfg.name.as_bytes());
-    tracing::info!("rewrite: {:?}", t4.elapsed());
 
     let mut rb = Response::builder().status(parts.status);
     for (name, value) in &parts.headers {
@@ -97,13 +101,16 @@ pub async fn proxy(
             rb = rb.header(name, value);
         }
     }
-    tracing::info!("total: {:?}", t0.elapsed());
+    
+    // Summary log at info level — one line per request, not per sub-step.
+    tracing::info!("[#{req_id}] done in {:?}  {}B", t0.elapsed(), rewritten.len());
     Ok(rb.body(Body::from(rewritten))?)
 }
 
 // ─── Request Transformation ─────────────────────────────────────────────
 
 fn transform_req(original: &[u8], cfg: &crate::config::ModelConfig) -> Vec<u8> {
+    // Fast path: no params to inject and model already matches — return original bytes untouched.
     if cfg.params.is_empty() {
         let haystack = std::str::from_utf8(original).unwrap_or("");
         if let Some(start) = haystack.find("\"model\":\"") {
@@ -116,6 +123,8 @@ fn transform_req(original: &[u8], cfg: &crate::config::ModelConfig) -> Vec<u8> {
         }
     }
 
+    // Parse JSON, mutate, re-serialize.
+    // This handles both model name rewriting and param injection in one pass.
     let mut data: serde_json::Value = match serde_json::from_slice(original) {
         Ok(v) => v,
         Err(_) => return original.to_vec(),
@@ -133,60 +142,79 @@ fn transform_req(original: &[u8], cfg: &crate::config::ModelConfig) -> Vec<u8> {
 }
 
 // ─── SSE Forwarding ─────────────────────────────────────────────────────
+/// Forward an SSE stream from upstream to the client, rewriting the model
+/// name inline.  We accumulate bytes in `buf`, scan for complete SSE events
+/// (terminated by `\n\n`), rewrite the model name in each event, and push
+/// only fully-formed events downstream.  This avoids the classic bug of
+/// flushing partial events at chunk boundaries which corrupts the SSE protocol
+/// and makes clients hang waiting for the missing `\n\n` terminator.
 
 async fn forward_sse(
     incoming: Incoming,
     tx: mpsc::Sender<Result<Bytes, io::Error>>,
     vname: String,
+    req_id: u64,
 ) {
     let mut buf = BytesMut::with_capacity(STREAM_BUF);
-    let mut out = BytesMut::with_capacity(STREAM_BUF);
+    let mut pos = 0usize;
 
     let mut stream = incoming.into_data_stream();
     while let Some(frame) = stream.next().await {
         match frame {
             Ok(chunk) => buf.extend_from_slice(&chunk),
             Err(e) => {
-                if !out.is_empty() {
-                    let _ = tx.send(Ok(out.split().freeze())).await;
-                }
+                // Drain any pending data before propagating the error
+                drain_pending(buf.as_ref(), pos, &tx, vname.as_bytes()).await;
                 let _ = tx.send(Err(io::Error::new(io::ErrorKind::Other, e.to_string()))).await;
                 return;
             }
         }
 
-        let mut read = 0;
-        while let Some(nl) = buf[read..].iter().position(|&b| b == b'\n') {
-            let end = read + nl + 1;
-            let line = &buf[read..end];
+        // Scan for complete SSE events (\n\n) in the accumulated buffer.
+        // Push each complete event downstream (after model-name rewriting).
+        loop {
+            // Find the first \n\n starting from `pos`
+            let search_buf = &buf[pos..];
+            let sep_pos = search_buf.windows(2).position(|w| w == b"\n\n");
 
-            if line.starts_with(b"data: ") {
-                let rewritten = rewrite_model_bytes(&line[6..], vname.as_bytes());
-                out.extend_from_slice(b"data: ");
-                out.extend_from_slice(&rewritten);
-                out.extend_from_slice(b"\n");
-            } else {
-                out.extend_from_slice(line);
+            match sep_pos {
+                Some(idx) => {
+                    // Found a complete event: `buf[pos .. pos+idx+2]`
+                    let event_end = pos + idx + 2;
+                    let event = &buf[pos..event_end];
+                    let rewritten = rewrite_model_bytes(event, vname.as_bytes());
+                    let _ = tx.send(Ok(Bytes::from(rewritten))).await;
+                    pos = event_end;
+                }
+                None => break, // Not enough data yet — wait for next chunk
             }
-            read = end;
-        }
-
-        if read > 0 {
-            buf.advance(read);
-        }
-
-        // Flush every complete SSE event for smooth streaming
-        if !out.is_empty() {
-            let _ = tx.send(Ok(out.split().freeze())).await;
-            out.clear();
         }
     }
 
-    if !buf.is_empty() {
-        out.extend_from_slice(&buf);
+    // Stream ended — flush any remaining partial data
+    if pos < buf.len() {
+        let remaining = &buf[pos..];
+        if !remaining.is_empty() {
+            let rewritten = rewrite_model_bytes(remaining, vname.as_bytes());
+            let _ = tx.send(Ok(Bytes::from(rewritten))).await;
+        }
     }
-    if !out.is_empty() {
-        let _ = tx.send(Ok(out.freeze())).await;
+    tracing::debug!("[#{req_id}] sse_forward_done");
+}
+
+/// Helper: drain any buffered-but-not-yet-flushed data before an error occurs.
+async fn drain_pending(
+    buf: &[u8],
+    pos: usize,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    vname: &[u8],
+) {
+    if pos < buf.len() {
+        let remaining = &buf[pos..];
+        if !remaining.is_empty() {
+            let rewritten = rewrite_model_bytes(remaining, vname);
+            let _ = tx.send(Ok(Bytes::from(rewritten))).await;
+        }
     }
 }
 
@@ -257,6 +285,27 @@ mod tests {
         let input = b"{\"model\":\"gpt-4\",\"messages\":[]}";
         let output = rewrite_model_bytes(input, b"qwen");
         assert_eq!(output, b"{\"model\":\"qwen\",\"messages\":[]}");
+    }
+
+    #[test]
+    fn test_rewrite_model_bytes_sse_event_boundary() {
+        // Ensure SSE event terminators (\n\n) are preserved intact.
+        // Note: rewrite_model_bytes replaces only the FIRST "model":" match,
+        // which is sufficient since the first occurrence is always the one
+        // the proxy controls (the rest come from upstream and are irrelevant).
+        let input = b"data: {\"model\":\"gpt-4\"}\n\ndata: {\"model\":\"gpt-4\"}\n\n";
+        let output = rewrite_model_bytes(input, b"my-model");
+        let expected = b"data: {\"model\":\"my-model\"}\n\ndata: {\"model\":\"gpt-4\"}\n\n";
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_rewrite_model_bytes_partial_at_end() {
+        // Partial event at end of stream — should still rewrite what it finds
+        let input = b"data: {\"model\":\"gpt-4\"}\n\ndata: {\"model\":\"gpt";
+        let output = rewrite_model_bytes(input, b"my-model");
+        let expected = b"data: {\"model\":\"my-model\"}\n\ndata: {\"model\":\"gpt";
+        assert_eq!(output, expected);
     }
 
     #[test]

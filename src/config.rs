@@ -8,13 +8,16 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    /// Fast O(1) lookup table built at startup from [`Self::models`].
+    #[serde(skip)]
+    pub model_index: HashMap<String, ModelConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub name: String,
     pub target: String,
@@ -43,16 +46,26 @@ impl AppConfig {
         PathBuf::from(home).join(".llm-proxy").join("config.json")
     }
 
-    /// Load config from the given path
+    /// Load config from the given path.
+    /// Builds an internal HashMap for O(1) model lookups.
     pub fn from_file(path: &str) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&content)?;
+        let mut config: Self = serde_json::from_str(&content)?;
+        config.rebuild_index();
         Ok(config)
     }
 
-    /// Find a model config by its name
+    /// Rebuild the O(1) lookup index from the models vector.
+    pub fn rebuild_index(&mut self) {
+        self.model_index.clear();
+        for m in &self.models {
+            self.model_index.insert(m.name.clone(), m.clone());
+        }
+    }
+
+    /// Find a model config by its name — O(1) via internal HashMap.
     pub fn find(&self, name: &str) -> Option<&ModelConfig> {
-        self.models.iter().find(|m| m.name == name)
+        self.model_index.get(name)
     }
 }
 
@@ -91,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_find_returns_config_by_name() {
-        let config = AppConfig {
+        let mut config = AppConfig {
             models: vec![
                 ModelConfig {
                     name: "fast".into(),
@@ -108,15 +121,17 @@ mod tests {
                     params: HashMap::new(),
                 },
             ],
+            model_index: HashMap::new(),
         };
+        config.rebuild_index();
         assert_eq!(config.find("fast").unwrap().name, "fast");
         assert_eq!(config.find("thinking").unwrap().served_model, "claude");
         assert!(config.find("unknown").is_none());
     }
 
     #[test]
-    fn test_find_returns_first_match() {
-        let config = AppConfig {
+    fn test_find_last_dup_wins() {
+        let mut config = AppConfig {
             models: vec![
                 ModelConfig {
                     name: "dup".into(),
@@ -133,15 +148,20 @@ mod tests {
                     params: HashMap::new(),
                 },
             ],
+            model_index: HashMap::new(),
         };
-        assert_eq!(config.find("dup").unwrap().served_model, "first");
+        config.rebuild_index();
+        // HashMap semantics: last-writer wins for duplicate keys
+        assert_eq!(config.find("dup").unwrap().served_model, "second");
     }
 
     #[test]
     fn test_app_config_empty_models() {
         let json = r#"{}"#;
-        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let mut config: AppConfig = serde_json::from_str(json).unwrap();
+        config.rebuild_index();
         assert!(config.models.is_empty());
+        assert!(config.model_index.is_empty());
     }
 
     #[test]

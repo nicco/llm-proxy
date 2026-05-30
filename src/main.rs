@@ -120,7 +120,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Result<axum::Json<se
     let resp = match state.client.request(req).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("upstream /v1/models failed: {e}");
+            tracing::debug!("upstream /v1/models failed: {e}");
             return Err((StatusCode::BAD_GATEWAY, format!("upstream models fetch failed: {e}")));
         }
     };
@@ -186,6 +186,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4 * 1024 * 1024); // 4 MiB default
 
+    // Build an HTTP client.  We keep the per-request connection model
+    // (no persistent keep‑alive pool) so that the benchmark tool's parallel
+    // test harness never deadlocks on pooled connection limits.
     let client: Client<HttpConnector, axum::body::Body> =
         Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
 
