@@ -17,6 +17,9 @@ struct AppState {
     config: config::AppConfig,
     client: Client<HttpConnector, axum::body::Body>,
     max_body: usize,
+    /// Max time to wait for upstream response *headers* (body streaming is
+    /// never time-limited).  `None` disables the limit.
+    header_timeout: Option<std::time::Duration>,
 }
 
 /// Catch-all: extract model from URL prefix or request body JSON.
@@ -28,32 +31,30 @@ async fn handle(
     let path = uri.path();
 
     // Try to extract model name from first path segment
-    let first_seg = path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty());
-
-    let model_name = if let Some(seg) = first_seg {
-        if state.config.find(seg).is_some() {
-            seg.to_string()
-        } else {
-            return infer_model_from_body(&state, path, req).await;
-        }
-    } else {
+    let trimmed = path.trim_start_matches('/');
+    let Some(seg) = trimmed.split('/').next().filter(|s| !s.is_empty()) else {
         return Err((StatusCode::BAD_REQUEST, "missing model name".to_string()));
     };
+    let Some(model_cfg) = state.config.find(seg) else {
+        return infer_model_from_body(&state, path, req).await;
+    };
 
-    let model_cfg = state
-        .config
-        .find(&model_name)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown model: {model_name}")))?;
+    let prefix_len = path.len() - trimmed.len(); // leading slash(es)
+    let remaining = &path[prefix_len + seg.len()..];
+    let mut upstream_url = format!("{}{}", model_cfg.target.trim_end_matches('/'), remaining);
+    if let Some(q) = uri.query() {
+        upstream_url.push('?');
+        upstream_url.push_str(q);
+    }
 
-    let remaining = &path[model_name.len() + 1..];
-    let upstream_url = format!("{}{}", model_cfg.target.trim_end_matches('/'), remaining);
-
-    let method = req.method().clone();
-    forward::proxy(&upstream_url, model_cfg, req, &state.client, method)
+    forward::proxy(
+        &upstream_url,
+        model_cfg,
+        req,
+        &state.client,
+        state.max_body,
+        state.header_timeout,
+    )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
@@ -93,16 +94,22 @@ async fn infer_model_from_body(
         .find(&model_name)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown model: {model_name}")))?;
 
-    let method = parts.method.clone();
+    let mut upstream_url = format!("{}{}", strip_url_path(&model_cfg.target), path);
+    if let Some(q) = parts.uri.query() {
+        upstream_url.push('?');
+        upstream_url.push_str(q);
+    }
+
     let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
 
-    let upstream_url = format!(
-        "{}{}",
-        strip_url_path(&model_cfg.target),
-        path
-    );
-
-    forward::proxy(&upstream_url, model_cfg, req, &state.client, method)
+    forward::proxy(
+        &upstream_url,
+        model_cfg,
+        req,
+        &state.client,
+        state.max_body,
+        state.header_timeout,
+    )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
@@ -186,13 +193,29 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4 * 1024 * 1024); // 4 MiB default
 
-    // Build an HTTP client.  We keep the per-request connection model
-    // (no persistent keep‑alive pool) so that the benchmark tool's parallel
-    // test harness never deadlocks on pooled connection limits.
-    let client: Client<HttpConnector, axum::body::Body> =
-        Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+    // How long to wait for upstream response headers before giving up.
+    // Generous default: for non-streaming requests, time-to-headers includes
+    // upstream queueing + the full generation.  0 disables the limit.
+    let header_timeout = std::env::var("LLM_PROXY_HEADER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+    let header_timeout = (header_timeout > 0).then(|| std::time::Duration::from_secs(header_timeout));
 
-    let state = Arc::new(AppState { config, client, max_body });
+    // Shared HTTP client with keep-alive connection pooling.  The pool limit
+    // only caps *idle* sockets per host — concurrent requests beyond it open
+    // fresh connections, so parallel bursts never queue behind the pool.
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true); // don't let Nagle delay small SSE chunks
+    connector.set_connect_timeout(Some(std::time::Duration::from_secs(10)));
+
+    let client: Client<HttpConnector, axum::body::Body> =
+        Client::builder(hyper_util::rt::TokioExecutor::new())
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(32)
+            .build(connector);
+
+    let state = Arc::new(AppState { config, client, max_body, header_timeout });
 
     let bind: std::net::SocketAddr = std::env::var("LLM_PROXY_BIND")
         .unwrap_or_else(|_| "0.0.0.0:7878".into())
