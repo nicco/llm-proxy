@@ -340,10 +340,12 @@ fn completion_check_nudge() -> String {
     "Verification step: re-read my original request and check that every \
      requested action, side effect, and output was actually completed with \
      the required tool calls — emails sent, events created, notifications \
-     made, results synthesized. If anything is missing, perform it now by \
-     calling the appropriate tool. If everything is complete, reply with \
-     your full final answer again, exactly as it should be shown to me — \
-     do not mention this verification step."
+     made, results synthesized. NEVER repeat an action that was already \
+     performed in this conversation — duplicated side effects are worse \
+     than missing ones. Only if something is genuinely missing, perform it \
+     now by calling the appropriate tool. If everything is complete, reply \
+     with your full final answer again, exactly as it should be shown to \
+     me — do not mention this verification step."
         .to_string()
 }
 
