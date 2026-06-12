@@ -89,6 +89,13 @@ pub struct FortifyConfig {
     pub rescue: bool,
     #[serde(default)]
     pub inject_respond_tool: bool,
+    /// After a plain-text response in a conversation that already contains
+    /// tool results, make one extra round-trip asking the model to verify it
+    /// completed every requested action (and to continue if not).  Such
+    /// requests are routed through the buffered path so the check can run
+    /// before any bytes reach the client.
+    #[serde(default)]
+    pub completion_check: bool,
 }
 
 fn default_true() -> bool {

@@ -76,7 +76,9 @@ pub(crate) async fn run(
         .expect("caller checked fortify");
     let fort = Fortifier::new(body_json, ctx.model_cfg, f);
 
-    if f.mode == FortifyMode::Hold && fort.client_stream {
+    // Completion-check candidates are routed through the buffered path so
+    // the check can run before any bytes reach the client.
+    if f.mode == FortifyMode::Hold && fort.client_stream && !fort.check_candidate {
         run_hold_streaming(&ctx, f, fort).await
     } else {
         run_buffered(&ctx, f, fort, 0).await
@@ -93,6 +95,9 @@ pub(crate) struct Fortifier {
     pub client_stream: bool,
     pub include_usage: bool,
     expect_tool: bool,
+    /// Completion check is enabled and the conversation already contains
+    /// tool results — a plain-text response gets one verification round.
+    pub check_candidate: bool,
 }
 
 impl Fortifier {
@@ -125,12 +130,22 @@ impl Fortifier {
                     .collect()
             })
             .unwrap_or_default();
+        let check_candidate = f.completion_check
+            && body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|msgs| {
+                    msgs.iter()
+                        .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+                })
+                .unwrap_or(false);
         Self {
             body,
             tool_names,
             client_stream,
             include_usage,
             expect_tool: f.inject_respond_tool || tool_choice_required,
+            check_candidate,
         }
     }
 
@@ -267,6 +282,17 @@ fn bad_args_nudge(name: &str) -> String {
 fn malformed_call_nudge() -> String {
     "Your previous reply contained a malformed tool call with no tool name. \
      Reply again with a correctly formatted tool call."
+        .to_string()
+}
+
+fn completion_check_nudge() -> String {
+    "Verification step: re-read my original request and check that every \
+     requested action, side effect, and output was actually completed with \
+     the required tool calls — emails sent, events created, notifications \
+     made, results synthesized. If anything is missing, perform it now by \
+     calling the appropriate tool. If everything is complete, reply with \
+     your full final answer again, exactly as it should be shown to me — \
+     do not mention this verification step."
         .to_string()
 }
 
@@ -595,6 +621,7 @@ async fn run_buffered(
     mut fort: Fortifier,
     mut retries_done: u32,
 ) -> Result<Response<Body>, anyhow::Error> {
+    let mut check_done = false;
     loop {
         let resp = send_upstream(
             &ctx.parts.method,
@@ -620,6 +647,13 @@ async fn run_buffered(
             .unwrap_or(Value::Null);
 
         match validate(&message, &fort.tool_names, f.rescue, fort.expect_tool) {
+            Verdict::TextOk if fort.check_candidate && !check_done => {
+                // One verification round: ask the model to confirm every
+                // requested action was completed, or continue if not.
+                check_done = true;
+                tracing::info!("[#{}] fortify completion check", ctx.req_id);
+                fort.push_nudge(&message, completion_check_nudge());
+            }
             Verdict::Valid | Verdict::TextOk => {
                 if f.inject_respond_tool {
                     strip_respond_in_completion(&mut completion);
@@ -1122,6 +1156,102 @@ mod tests {
             "usage must be omitted unless requested"
         );
         assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    // ── completion check ──
+
+    #[test]
+    fn test_check_candidate_requires_flag_and_tool_results() {
+        let mut f = fortify_cfg();
+        f.completion_check = true;
+        let cfg = model_cfg("http://x");
+        let with_tool_result: Value = serde_json::from_str(
+            r#"{"model":"alias","messages":[
+                {"role":"user","content":"do it"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"search","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"result"}],
+                "tools":[{"type":"function","function":{"name":"search"}}]}"#,
+        )
+        .unwrap();
+        assert!(Fortifier::new(with_tool_result.clone(), &cfg, &f).check_candidate);
+
+        let fresh: Value = serde_json::from_str(
+            r#"{"model":"alias","messages":[{"role":"user","content":"hi"}],
+                "tools":[{"type":"function","function":{"name":"search"}}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !Fortifier::new(fresh.clone(), &cfg, &f).check_candidate,
+            "no prior tool results — restraint cases must not be pushed toward tools"
+        );
+
+        let f_off = fortify_cfg();
+        assert!(!Fortifier::new(with_tool_result, &cfg, &f_off).check_candidate);
+    }
+
+    #[tokio::test]
+    async fn test_completion_check_round_recovers_missing_action() {
+        // Turn 1 response: plain text claiming done (but email never sent).
+        let lazy_text = r#"{"id":"c1","object":"chat.completion","created":1,"model":"real-model","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"I looked up Tom Chen for you."}}]}"#;
+        // Check-round response: the model completes the missing tool call.
+        let fixed = r#"{"id":"c2","object":"chat.completion","created":1,"model":"real-model","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"ok1","type":"function","function":{"name":"send_email","arguments":"{\"to\":\"tom\"}"}}]}}]}"#;
+        let (addr, seen) = mock_upstream(vec![
+            http_response("application/json", lazy_text),
+            http_response("application/json", fixed),
+        ])
+        .await;
+
+        let mut cfg = model_cfg(&format!("http://{addr}/v1"));
+        cfg.fortify.as_mut().unwrap().completion_check = true;
+        let client: Client<HttpConnector, Body> =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/alias/v1/chat/completions")
+            .body(Body::from(
+                r#"{"model":"alias","stream":true,"messages":[
+                    {"role":"user","content":"find tom and email him"},
+                    {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"search","arguments":"{}"}}]},
+                    {"role":"tool","tool_call_id":"c1","content":"Tom Chen <tom@x>"}],
+                    "tools":[{"type":"function","function":{"name":"search"}},{"type":"function","function":{"name":"send_email"}}]}"#,
+            ))
+            .unwrap();
+
+        let resp = crate::forward::proxy(
+            &format!("http://{addr}/v1/chat/completions"),
+            &cfg,
+            req,
+            &client,
+            1 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        // Despite stream:true the candidate is routed buffered, checked, and
+        // the recovered tool call is synthesized as SSE.
+        assert!(
+            text.contains("send_email"),
+            "missing recovered call: {text}"
+        );
+        assert!(text.ends_with("data: [DONE]\n\n"));
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "exactly one check round");
+        let check_req: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let msgs = check_req["messages"].as_array().unwrap();
+        assert!(msgs[msgs.len() - 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Verification step"));
+        assert!(msgs[msgs.len() - 2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("I looked up Tom Chen"));
     }
 
     // ── integration: invalid stream attempt → nudged retry → synthesized SSE ──

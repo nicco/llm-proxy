@@ -136,6 +136,7 @@ messages appended to the conversation.
 | `max_retries` | `3` | Upstream re-asks after an invalid tool call before degrading to the last response as-is |
 | `rescue` | `true` | Attempt to parse tool calls out of malformed text responses |
 | `inject_respond_tool` | `false` | Append a synthetic `respond` tool so the model always tool-calls; respond calls are converted back to plain text |
+| `completion_check` | `false` | After a plain-text answer in a conversation that already has tool results, one extra round asks the model to verify every requested action was completed (and continue if not). Candidate requests are buffered |
 
 Fortification only engages for `POST …/chat/completions` requests carrying a
 non-empty `tools` array (and `n` ≤ 1). Everything else — including all
