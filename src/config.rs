@@ -31,6 +31,37 @@ pub struct ModelConfig {
     /// `None` means pure passthrough — the proxy never parses responses.
     #[serde(default)]
     pub fortify: Option<FortifyConfig>,
+    /// Smart system-prompt injection for tools-bearing chat requests.
+    #[serde(default)]
+    pub inject: Option<InjectConfig>,
+}
+
+/// Conditionally inject instruction blocks into the system message of
+/// POST …/chat/completions requests that carry tools.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectConfig {
+    /// Skip all injection when the request already carries a system message
+    /// larger than this many bytes — agent harnesses like Claude Code ship
+    /// their own tool discipline and need no help.
+    pub skip_if_system_over: Option<usize>,
+    pub blocks: Vec<InjectBlock>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectBlock {
+    pub name: String,
+    /// Inline rule text…
+    pub text: Option<String>,
+    /// …or a file path (relative paths resolve against the config file's
+    /// directory). Loaded once at startup into `text`.
+    pub file: Option<String>,
+    /// Inject only when any keyword appears (case-insensitive) in a tool
+    /// name or description. Empty = always (when tools are present).
+    #[serde(default)]
+    pub match_tools: Vec<String>,
+    /// Inject only when the request's `tool_choice` equals this string
+    /// (e.g. "required").
+    pub match_tool_choice: Option<String>,
 }
 
 /// How fortified requests interact with streaming.
@@ -94,8 +125,42 @@ impl AppConfig {
     pub fn from_file(path: &str) -> Result<Self, anyhow::Error> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Self = serde_json::from_str(&content)?;
+        let base = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+        config.resolve_inject_files(base.as_deref())?;
         config.rebuild_index();
         Ok(config)
+    }
+
+    /// Load `file`-based inject blocks into their `text` field, failing fast
+    /// at startup on missing files rather than per-request.
+    fn resolve_inject_files(
+        &mut self,
+        base: Option<&std::path::Path>,
+    ) -> Result<(), anyhow::Error> {
+        for m in &mut self.models {
+            let Some(inject) = &mut m.inject else {
+                continue;
+            };
+            for b in &mut inject.blocks {
+                if let Some(file) = &b.file {
+                    let p = std::path::Path::new(file);
+                    let full = match base {
+                        Some(dir) if p.is_relative() => dir.join(p),
+                        _ => p.to_path_buf(),
+                    };
+                    b.text = Some(std::fs::read_to_string(&full).map_err(|e| {
+                        anyhow::anyhow!("inject block '{}' ({}): {e}", b.name, full.display())
+                    })?);
+                }
+                if b.text.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    anyhow::bail!(
+                        "inject block '{}' has neither text nor file content",
+                        b.name
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild the O(1) lookup index from the models vector.
@@ -162,6 +227,7 @@ mod tests {
                     api_key: None,
                     params: HashMap::new(),
                     fortify: None,
+                    inject: None,
                 },
                 ModelConfig {
                     name: "thinking".into(),
@@ -170,6 +236,7 @@ mod tests {
                     api_key: None,
                     params: HashMap::new(),
                     fortify: None,
+                    inject: None,
                 },
             ],
             model_index: HashMap::new(),
@@ -191,6 +258,7 @@ mod tests {
                     api_key: None,
                     params: HashMap::new(),
                     fortify: None,
+                    inject: None,
                 },
                 ModelConfig {
                     name: "dup".into(),
@@ -199,6 +267,7 @@ mod tests {
                     api_key: None,
                     params: HashMap::new(),
                     fortify: None,
+                    inject: None,
                 },
             ],
             model_index: HashMap::new(),

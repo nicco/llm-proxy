@@ -32,29 +32,37 @@ pub(crate) struct RunCtx<'a> {
     pub req_id: u64,
 }
 
-/// Gate for the fortified path.  Returns the parsed request body when every
-/// condition holds, so `run` never re-parses.
-pub(crate) fn applies(
-    parts: &axum::http::request::Parts,
-    body: &Bytes,
-    cfg: &ModelConfig,
-) -> Option<Value> {
-    let f = cfg.fortify.as_ref()?;
-    if !f.enabled
-        || parts.method != axum::http::Method::POST
-        || !parts.uri.path().ends_with("/chat/completions")
-    {
-        return None;
-    }
-    let body_json: Value = serde_json::from_slice(body).ok()?;
-    if body_json.get("tools")?.as_array()?.is_empty() {
-        return None;
-    }
+/// Body-level gate for the fortified path.  The caller has already checked
+/// method, path, and that fortify is enabled for the model.
+pub(crate) fn applies_parsed(body_json: &Value) -> bool {
+    let has_tools = body_json
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
     // Multi-choice responses are not fortified.
-    if body_json.get("n").and_then(|v| v.as_u64()).unwrap_or(1) != 1 {
-        return None;
+    let single = body_json.get("n").and_then(|v| v.as_u64()).unwrap_or(1) == 1;
+    has_tools && single
+}
+
+/// Standard per-model body mutation: overwrite the model name and merge the
+/// configured params (config always wins).  Shared by the fortify path and
+/// the inject-only path.
+pub(crate) fn apply_model_params(body: &mut Value, cfg: &ModelConfig) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".into(), Value::String(cfg.served_model.clone()));
+        for (k, v) in &cfg.params {
+            obj.insert(k.clone(), v.clone());
+        }
     }
-    Some(body_json)
+}
+
+/// Finalize a parsed (possibly inject-mutated) body for plain forwarding.
+pub(crate) fn finalize_plain_body(mut body: Value, cfg: &ModelConfig) -> Bytes {
+    apply_model_params(&mut body, cfg);
+    serde_json::to_vec(&body)
+        .map(Bytes::from)
+        .unwrap_or_default()
 }
 
 pub(crate) async fn run(
@@ -65,7 +73,7 @@ pub(crate) async fn run(
         .model_cfg
         .fortify
         .as_ref()
-        .expect("applies() checked fortify");
+        .expect("caller checked fortify");
     let fort = Fortifier::new(body_json, ctx.model_cfg, f);
 
     if f.mode == FortifyMode::Hold && fort.client_stream {
@@ -97,12 +105,11 @@ impl Fortifier {
             .pointer("/stream_options/include_usage")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".into(), Value::String(cfg.served_model.clone()));
-            for (k, v) in &cfg.params {
-                obj.insert(k.clone(), v.clone());
-            }
-        }
+        apply_model_params(&mut body, cfg);
+        // The model is expected to call a tool when the synthetic respond
+        // tool is in play, or when the client demanded one outright.
+        let tool_choice_required =
+            body.get("tool_choice").and_then(|v| v.as_str()) == Some("required");
         if f.inject_respond_tool {
             if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
                 tools.push(respond_spec());
@@ -123,7 +130,7 @@ impl Fortifier {
             tool_names,
             client_stream,
             include_usage,
-            expect_tool: f.inject_respond_tool,
+            expect_tool: f.inject_respond_tool || tool_choice_required,
         }
     }
 
@@ -233,7 +240,7 @@ pub(crate) fn validate(
     }
     if expect_tool {
         return Verdict::Invalid {
-            nudge: retry_nudge(),
+            nudge: retry_nudge(tool_names.contains(RESPOND_TOOL)),
         };
     }
     Verdict::TextOk
@@ -263,12 +270,19 @@ fn malformed_call_nudge() -> String {
         .to_string()
 }
 
-fn retry_nudge() -> String {
-    format!(
-        "You must reply by calling one of the available tools. To answer the user \
-         in plain text, call the \"{RESPOND_TOOL}\" tool with your answer in its \
-         \"message\" argument."
-    )
+fn retry_nudge(has_respond_tool: bool) -> String {
+    if has_respond_tool {
+        format!(
+            "You must reply by calling one of the available tools. To answer the user \
+             in plain text, call the \"{RESPOND_TOOL}\" tool with your answer in its \
+             \"message\" argument."
+        )
+    } else {
+        "You must reply by calling one of the available tools — plain text is not \
+         an acceptable reply for this request. Reply again with a correctly \
+         formatted tool call."
+            .to_string()
+    }
 }
 
 // ─── Synthetic respond tool ─────────────────────────────────────────────
@@ -861,70 +875,44 @@ mod tests {
             api_key: None,
             params: std::collections::HashMap::new(),
             fortify: Some(fortify_cfg()),
+            inject: None,
         }
     }
 
-    fn parts(method: &str, path: &str) -> axum::http::request::Parts {
-        let (parts, _) = axum::http::Request::builder()
-            .method(method)
-            .uri(path)
-            .body(())
-            .unwrap()
-            .into_parts();
-        parts
-    }
-
-    fn chat_body(extra: &str) -> Bytes {
-        Bytes::from(format!(
+    fn chat_json(extra: &str) -> Value {
+        serde_json::from_str(&format!(
             r#"{{"model":"alias","messages":[{{"role":"user","content":"hi"}}],"tools":[{{"type":"function","function":{{"name":"search","parameters":{{}}}}}}]{extra}}}"#
         ))
+        .unwrap()
     }
 
-    // ── applies() gate ──
+    // ── applies_parsed() gate ──
 
     #[test]
-    fn test_applies_on_tools_post_chat_completions() {
-        let cfg = model_cfg("http://x");
-        let p = parts("POST", "/alias/v1/chat/completions");
-        assert!(applies(&p, &chat_body(""), &cfg).is_some());
+    fn test_applies_parsed_on_tools_body() {
+        assert!(applies_parsed(&chat_json("")));
+        assert!(applies_parsed(&chat_json(",\"n\":1")));
     }
 
     #[test]
-    fn test_applies_rejects_wrong_method_path_and_shape() {
-        let cfg = model_cfg("http://x");
-        assert!(applies(
-            &parts("GET", "/alias/v1/chat/completions"),
-            &chat_body(""),
-            &cfg
-        )
-        .is_none());
-        assert!(applies(
-            &parts("POST", "/alias/v1/completions"),
-            &chat_body(""),
-            &cfg
-        )
-        .is_none());
-        let no_tools = Bytes::from(r#"{"model":"alias","messages":[]}"#);
-        assert!(applies(
-            &parts("POST", "/alias/v1/chat/completions"),
-            &no_tools,
-            &cfg
-        )
-        .is_none());
-        assert!(applies(
-            &parts("POST", "/alias/v1/chat/completions"),
-            &chat_body(",\"n\":2"),
-            &cfg
-        )
-        .is_none());
-        let mut off = model_cfg("http://x");
-        off.fortify = None;
-        assert!(applies(
-            &parts("POST", "/alias/v1/chat/completions"),
-            &chat_body(""),
-            &off
-        )
-        .is_none());
+    fn test_applies_parsed_rejects_no_tools_and_multi_choice() {
+        let no_tools: Value = serde_json::from_str(r#"{"model":"alias","messages":[]}"#).unwrap();
+        assert!(!applies_parsed(&no_tools));
+        let empty_tools: Value =
+            serde_json::from_str(r#"{"model":"alias","messages":[],"tools":[]}"#).unwrap();
+        assert!(!applies_parsed(&empty_tools));
+        assert!(!applies_parsed(&chat_json(",\"n\":2")));
+    }
+
+    #[test]
+    fn test_finalize_plain_body_applies_model_and_params() {
+        let mut cfg = model_cfg("http://x");
+        cfg.params
+            .insert("temperature".into(), serde_json::json!(0.5));
+        let out = finalize_plain_body(chat_json(""), &cfg);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "real-model");
+        assert_eq!(v["temperature"], 0.5);
     }
 
     // ── validate() ──

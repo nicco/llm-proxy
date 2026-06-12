@@ -1,0 +1,3 @@
+<TOOL_CHOICE_REQUIRED>
+The runtime setting tool_choice=required is active: you MUST call one of the available tools this turn. A plain-text reply is not acceptable. Choose the most relevant tool and call it with schema-valid arguments.
+</TOOL_CHOICE_REQUIRED>

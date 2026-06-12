@@ -71,6 +71,40 @@ For each request the proxy:
 
 Streaming responses are forwarded in real-time with model name rewriting applied to every `data:` line. No intermediate buffering.
 
+## Smart system-prompt injection
+
+Optional per-model injection of instruction blocks into the system message of
+tools-bearing `POST …/chat/completions` requests — the agent-template trick,
+but visible in config, per-alias, selective, and hot-swappable with a proxy
+restart instead of a model reload:
+
+```json
+"inject": {
+  "skip_if_system_over": 6000,
+  "blocks": [
+    {"name": "security", "file": "rules/security.txt"},
+    {"name": "channels", "file": "rules/side-effect-channels.txt",
+     "match_tools": ["email", "calendar", "remind"]},
+    {"name": "tool-required", "file": "rules/tool-required.txt",
+     "match_tool_choice": "required"}
+  ]
+}
+```
+
+- Blocks with no matcher always inject (when tools are present); `match_tools`
+  keywords match case-insensitively against tool names/descriptions;
+  `match_tool_choice` matches the request's `tool_choice` string.
+- `skip_if_system_over` skips injection entirely when the client already
+  sends a system message larger than N bytes (agent harnesses like Claude
+  Code ship their own tool discipline).
+- `file` paths resolve relative to the config directory and load at startup;
+  `text` works inline. Reference blocks live in [`rules/`](rules/).
+- Injected blocks merge into an existing leading system message or are
+  inserted as a new one. Requests without tools are untouched.
+
+When fortify is also enabled, `tool_choice: "required"` additionally makes a
+plain-text response retryable (the model is nudged to produce a tool call).
+
 ## Tool-call fortification (forge-style)
 
 Optional per-model reliability layer for tool calling, ported from

@@ -108,26 +108,48 @@ pub async fn proxy(
     // Buffer request body for transformation, bounded by the configured limit.
     let body_bytes = axum::body::to_bytes(body, max_body).await?;
 
-    // Tool-call fortification path: only for opted-in models on POST
-    // …/chat/completions with a non-empty `tools` array.  Everything else
-    // stays on the zero-parse path below, byte-identical to before.
-    if let Some(body_json) = crate::fortify::applies(&parts, &body_bytes, model_cfg) {
-        return crate::fortify::run(
-            crate::fortify::RunCtx {
-                upstream_url,
-                model_cfg,
-                parts: &parts,
-                client,
-                header_timeout,
-                req_id,
-            },
-            body_json,
-        )
-        .await;
-    }
+    // Parse-and-mutate path for opted-in models (fortify and/or inject) on
+    // POST …/chat/completions.  Everything else stays on the zero-parse
+    // path below, byte-identical to before.
+    let fortify_on = model_cfg
+        .fortify
+        .as_ref()
+        .map(|f| f.enabled)
+        .unwrap_or(false);
+    let is_chat_post =
+        parts.method == hyper::Method::POST && parts.uri.path().ends_with("/chat/completions");
+    let parsed = if is_chat_post && (fortify_on || model_cfg.inject.is_some()) {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes).ok()
+    } else {
+        None
+    };
 
-    // Transform the request body (inject params, rewrite model name).
-    let transformed = transform_req(&body_bytes, model_cfg);
+    let transformed = match parsed {
+        Some(mut body_json) => {
+            if let Some(ic) = &model_cfg.inject {
+                crate::inject::apply(&mut body_json, ic, req_id);
+            }
+            if fortify_on && crate::fortify::applies_parsed(&body_json) {
+                return crate::fortify::run(
+                    crate::fortify::RunCtx {
+                        upstream_url,
+                        model_cfg,
+                        parts: &parts,
+                        client,
+                        header_timeout,
+                        req_id,
+                    },
+                    body_json,
+                )
+                .await;
+            }
+            // Injection without fortification (or a tool-less request on a
+            // fortified model): finalize and continue down the normal path.
+            crate::fortify::finalize_plain_body(body_json, model_cfg)
+        }
+        // Zero-parse transform (inject params, rewrite model name).
+        None => transform_req(&body_bytes, model_cfg),
+    };
 
     let t1 = Instant::now();
     let resp = send_upstream(
@@ -550,6 +572,7 @@ mod tests {
             api_key: None,
             params,
             fortify: None,
+            inject: None,
         }
     }
 
