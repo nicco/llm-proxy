@@ -6,6 +6,7 @@
 //! preserved (hold-and-release) and the README for the retry/rescue matrix.
 
 mod rescue;
+mod schema;
 mod stream;
 
 use axum::body::Body;
@@ -92,6 +93,8 @@ pub(crate) async fn run(
 pub(crate) struct Fortifier {
     body: Value,
     pub tool_names: HashSet<String>,
+    /// Tool name → `function.parameters` JSON Schema, for argument checks.
+    pub tool_schemas: std::collections::HashMap<String, Value>,
     pub client_stream: bool,
     pub include_usage: bool,
     expect_tool: bool,
@@ -130,6 +133,23 @@ impl Fortifier {
                     .collect()
             })
             .unwrap_or_default();
+        let tool_schemas: std::collections::HashMap<String, Value> = if f.validate_args {
+            body.get("tools")
+                .and_then(|v| v.as_array())
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|t| {
+                            let name = t.pointer("/function/name")?.as_str()?.to_string();
+                            let params = t.pointer("/function/parameters")?.clone();
+                            Some((name, params))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let check_candidate = f.completion_check
             && body
                 .get("messages")
@@ -142,11 +162,42 @@ impl Fortifier {
         Self {
             body,
             tool_names,
+            tool_schemas,
             client_stream,
             include_usage,
             expect_tool: f.inject_respond_tool || tool_choice_required,
             check_candidate,
         }
+    }
+
+    /// Schema-check every tool call in a validated message.  Returns a
+    /// corrective nudge when any call violates its tool's parameter schema.
+    fn schema_nudge(&self, message: &Value) -> Option<String> {
+        let calls = message.get("tool_calls")?.as_array()?;
+        let mut problems = Vec::new();
+        for tc in calls {
+            let name = tc.pointer("/function/name")?.as_str()?;
+            let Some(sch) = self.tool_schemas.get(name) else {
+                continue;
+            };
+            let args = match tc.pointer("/function/arguments") {
+                Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+                Some(Value::String(s)) => serde_json::from_str(s).ok()?,
+                Some(v @ Value::Object(_)) => v.clone(),
+                _ => continue,
+            };
+            for v in schema::violations(&args, sch) {
+                problems.push(format!("call to \"{name}\": {v}"));
+            }
+        }
+        if problems.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Your previous tool call did not match the tool's parameter schema — {}. \
+             Reply again with a corrected call that satisfies the schema exactly.",
+            problems.join("; ")
+        ))
     }
 
     fn upstream_body(&self, stream: bool) -> Bytes {
@@ -654,7 +705,29 @@ async fn run_buffered(
                 tracing::info!("[#{}] fortify completion check", ctx.req_id);
                 fort.push_nudge(&message, completion_check_nudge());
             }
-            Verdict::Valid | Verdict::TextOk => {
+            Verdict::Valid => {
+                if let Some(nudge) = fort.schema_nudge(&message) {
+                    if retries_done >= f.max_retries {
+                        tracing::warn!(
+                            "[#{}] fortify retries exhausted — returning last response",
+                            ctx.req_id
+                        );
+                        return emit_final(ctx, &fort, completion);
+                    }
+                    retries_done += 1;
+                    tracing::info!(
+                        "[#{}] fortify retry {retries_done}: schema violation",
+                        ctx.req_id
+                    );
+                    fort.push_nudge(&message, nudge);
+                    continue;
+                }
+                if f.inject_respond_tool {
+                    strip_respond_in_completion(&mut completion);
+                }
+                return emit_final(ctx, &fort, completion);
+            }
+            Verdict::TextOk => {
                 if f.inject_respond_tool {
                     strip_respond_in_completion(&mut completion);
                 }
@@ -765,6 +838,14 @@ async fn run_hold_streaming(
     let message = machine.acc.message_json();
     match validate(&message, &fort.tool_names, f.rescue, fort.expect_tool) {
         Verdict::Valid => {
+            if let Some(nudge) = fort.schema_nudge(&message) {
+                tracing::info!(
+                    "[#{}] fortify retry 1: schema violation in stream",
+                    ctx.req_id
+                );
+                fort.push_nudge(&message, nudge);
+                return run_buffered(ctx, f, fort, 1).await;
+            }
             let mut completion = completion_from_acc(&machine.acc, message);
             if f.inject_respond_tool && strip_respond_in_completion(&mut completion) {
                 emit_final(ctx, &fort, completion)
@@ -1252,6 +1333,69 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("I looked up Tom Chen"));
+    }
+
+    #[tokio::test]
+    async fn test_schema_violation_retried_with_precise_nudge() {
+        // The production failure: edit called with {newText, path} instead
+        // of the required {path, edits}.
+        let bad = r#"{"id":"c1","object":"chat.completion","created":1,"model":"real-model","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"x1","type":"function","function":{"name":"edit","arguments":"{\"newText\": \"const x = 1;\", \"path\": \"/a/main.js\"}"}}]}}]}"#;
+        let good = r#"{"id":"c2","object":"chat.completion","created":1,"model":"real-model","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"x2","type":"function","function":{"name":"edit","arguments":"{\"path\": \"/a/main.js\", \"edits\": []}"}}]}}]}"#;
+        let (addr, seen) = mock_upstream(vec![
+            http_response("application/json", bad),
+            http_response("application/json", good),
+        ])
+        .await;
+
+        let cfg = model_cfg(&format!("http://{addr}/v1"));
+        let client: Client<HttpConnector, Body> =
+            Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/alias/v1/chat/completions")
+            .body(Body::from(
+                r#"{"model":"alias","stream":false,"messages":[{"role":"user","content":"fix it"}],
+                    "tools":[{"type":"function","function":{"name":"edit","parameters":{
+                        "type":"object",
+                        "properties":{"path":{"type":"string"},"edits":{"type":"array"}},
+                        "required":["path","edits"],"additionalProperties":false}}}]}"#,
+            ))
+            .unwrap();
+
+        let resp = crate::forward::proxy(
+            &format!("http://{addr}/v1/chat/completions"),
+            &cfg,
+            req,
+            &client,
+            1 << 20,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        assert!(args.contains("edits"), "corrected call expected: {args}");
+
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "exactly one schema retry");
+        let retry: Value = serde_json::from_str(&bodies[1]).unwrap();
+        let nudge = retry["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            nudge.contains("missing required property \"edits\""),
+            "{nudge}"
+        );
+        assert!(
+            nudge.contains("unsupported property \"newText\""),
+            "{nudge}"
+        );
     }
 
     // ── integration: invalid stream attempt → nudged retry → synthesized SSE ──

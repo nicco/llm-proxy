@@ -87,6 +87,12 @@ pub struct FortifyConfig {
     pub max_retries: u32,
     #[serde(default = "default_true")]
     pub rescue: bool,
+    /// Check tool-call arguments against each tool's JSON Schema
+    /// (`required`, `additionalProperties: false`, top-level types) and
+    /// retry with a precise nudge on violations.  Conservative: schema
+    /// constructs the checker doesn't understand always pass.
+    #[serde(default = "default_true")]
+    pub validate_args: bool,
     #[serde(default)]
     pub inject_respond_tool: bool,
     /// After a plain-text response in a conversation that already contains
