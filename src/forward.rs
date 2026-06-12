@@ -36,11 +36,60 @@ fn skip_request_header(name: &str) -> bool {
     )
 }
 
-fn skip_response_header(name: &str) -> bool {
+pub(crate) fn skip_response_header(name: &str) -> bool {
     matches!(
         name,
         "connection" | "keep-alive" | "transfer-encoding" | "content-length"
     )
+}
+
+/// Build and send the upstream request: copy client headers (minus hop-by-hop
+/// and recomputed ones), inject the configured api key, and bound the wait for
+/// response *headers* only — body streaming is never timed.
+pub(crate) async fn send_upstream(
+    method: &hyper::Method,
+    headers: &hyper::HeaderMap,
+    upstream_url: &str,
+    body: Bytes,
+    model_cfg: &crate::config::ModelConfig,
+    client: &Client<HttpConnector, Body>,
+    header_timeout: Option<std::time::Duration>,
+) -> Result<hyper::Response<hyper::body::Incoming>, anyhow::Error> {
+    let mut builder = hyper::Request::builder()
+        .method(method.clone())
+        .uri(upstream_url)
+        .header("content-type", "application/json")
+        .header("content-length", body.len());
+
+    let inject_auth = model_cfg.api_key.is_some();
+    for (name, value) in headers.iter() {
+        // HeaderName is guaranteed lowercase — no per-header allocation needed.
+        let n = name.as_str();
+        if skip_request_header(n) || (inject_auth && n == "authorization") {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    if let Some(api_key) = &model_cfg.api_key {
+        builder = builder.header("authorization", format!("Bearer {api_key}"));
+    }
+
+    let outgoing = builder.body(Body::from(body))?;
+
+    // A wedged upstream that accepts connections but never replies would
+    // otherwise pin this request (and its client connection) forever.
+    match header_timeout {
+        Some(limit) => tokio::time::timeout(limit, client.request(outgoing))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "upstream sent no response headers within {limit:?} (header timeout)"
+                )
+            })?
+            .map_err(Into::into),
+        None => client.request(outgoing).await.map_err(Into::into),
+    }
 }
 
 /// Forward request: transform body, call upstream, rewrite model name in response.
@@ -59,46 +108,45 @@ pub async fn proxy(
     // Buffer request body for transformation, bounded by the configured limit.
     let body_bytes = axum::body::to_bytes(body, max_body).await?;
 
+    // Tool-call fortification path: only for opted-in models on POST
+    // …/chat/completions with a non-empty `tools` array.  Everything else
+    // stays on the zero-parse path below, byte-identical to before.
+    if let Some(body_json) = crate::fortify::applies(&parts, &body_bytes, model_cfg) {
+        return crate::fortify::run(
+            crate::fortify::RunCtx {
+                upstream_url,
+                model_cfg,
+                parts: &parts,
+                client,
+                header_timeout,
+                req_id,
+            },
+            body_json,
+        )
+        .await;
+    }
+
     // Transform the request body (inject params, rewrite model name).
     let transformed = transform_req(&body_bytes, model_cfg);
 
-    let mut builder = hyper::Request::builder()
-        .method(parts.method.clone())
-        .uri(upstream_url)
-        .header("content-type", "application/json")
-        .header("content-length", transformed.len());
-
-    let inject_auth = model_cfg.api_key.is_some();
-    for (name, value) in parts.headers.iter() {
-        // HeaderName is guaranteed lowercase — no per-header allocation needed.
-        let n = name.as_str();
-        if skip_request_header(n) || (inject_auth && n == "authorization") {
-            continue;
-        }
-        builder = builder.header(name, value);
-    }
-
-    if let Some(api_key) = &model_cfg.api_key {
-        builder = builder.header("authorization", format!("Bearer {api_key}"));
-    }
-
     let t1 = Instant::now();
-    let outgoing = builder.body(Body::from(transformed))?;
-
-    // Bound the wait for response *headers* only — a wedged upstream that
-    // accepts connections but never replies would otherwise pin this request
-    // (and its client connection) forever.  Body streaming is never timed.
-    let resp = match header_timeout {
-        Some(limit) => tokio::time::timeout(limit, client.request(outgoing))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("upstream sent no response headers within {limit:?} (header timeout)")
-            })??,
-        None => client.request(outgoing).await?,
-    };
+    let resp = send_upstream(
+        &parts.method,
+        &parts.headers,
+        upstream_url,
+        transformed,
+        model_cfg,
+        client,
+        header_timeout,
+    )
+    .await?;
 
     // Log upstream timing at debug level to avoid I/O spam under burst load.
-    tracing::debug!("[#{req_id}] upstream: {:?}  status={}", t1.elapsed(), resp.status());
+    tracing::debug!(
+        "[#{req_id}] upstream: {:?}  status={}",
+        t1.elapsed(),
+        resp.status()
+    );
 
     let (parts, incoming) = resp.into_parts();
 
@@ -134,7 +182,11 @@ pub async fn proxy(
     let rewritten = rewrite_model_bytes(body, model_cfg.name.as_bytes());
 
     // Summary log at info level — one line per request, not per sub-step.
-    tracing::info!("[#{req_id}] done in {:?}  {}B", t0.elapsed(), rewritten.len());
+    tracing::info!(
+        "[#{req_id}] done in {:?}  {}B",
+        t0.elapsed(),
+        rewritten.len()
+    );
     Ok(rb.body(Body::from(rewritten))?)
 }
 
@@ -163,7 +215,10 @@ fn transform_req(original: &Bytes, cfg: &crate::config::ModelConfig) -> Bytes {
     };
 
     if let Some(obj) = data.as_object_mut() {
-        obj.insert("model".into(), serde_json::Value::String(cfg.served_model.clone()));
+        obj.insert(
+            "model".into(),
+            serde_json::Value::String(cfg.served_model.clone()),
+        );
         for (k, v) in &cfg.params {
             // Always inject model params (override client values)
             obj.insert(k.clone(), v.clone());
@@ -275,7 +330,7 @@ where
 
 /// Find the end (exclusive, including the `\n\n`) of the first complete SSE
 /// event in `buf`, resuming from where the previous scan left off.
-fn next_event_end(buf: &[u8], scanned: &mut usize) -> Option<usize> {
+pub(crate) fn next_event_end(buf: &[u8], scanned: &mut usize) -> Option<usize> {
     // Back up one byte: the terminator may straddle the previous chunk boundary.
     let start = scanned.saturating_sub(1);
     if let Some(idx) = buf[start..].windows(2).position(|w| w == b"\n\n") {
@@ -287,7 +342,7 @@ fn next_event_end(buf: &[u8], scanned: &mut usize) -> Option<usize> {
 
 // ─── Raw Byte Model Name Rewriting ──────────────────────────────────────
 
-fn rewrite_model_bytes(body: Bytes, vname: &[u8]) -> Bytes {
+pub(crate) fn rewrite_model_bytes(body: Bytes, vname: &[u8]) -> Bytes {
     const NEEDLE: &[u8] = b"\"model\":\"";
     let Some(start) = body.windows(NEEDLE.len()).position(|w| w == NEEDLE) else {
         return body;
@@ -372,7 +427,10 @@ mod tests {
     #[test]
     fn test_rewrite_model_bytes_partial_at_end() {
         // Partial event at end of stream — should still rewrite what it finds
-        let output = rewrite(b"data: {\"model\":\"gpt-4\"}\n\ndata: {\"model\":\"gpt", b"my-model");
+        let output = rewrite(
+            b"data: {\"model\":\"gpt-4\"}\n\ndata: {\"model\":\"gpt",
+            b"my-model",
+        );
         let expected: &[u8] = b"data: {\"model\":\"my-model\"}\n\ndata: {\"model\":\"gpt";
         assert_eq!(&output[..], expected);
     }
@@ -395,9 +453,13 @@ mod tests {
         // Two events split across three chunks: the event terminator and the
         // "model" key both straddle chunk boundaries.
         let chunks: Vec<Result<Frame<Bytes>, Infallible>> = vec![
-            Ok(Frame::data(Bytes::from_static(b"data: {\"model\":\"real\",\"x\":1}\n"))),
+            Ok(Frame::data(Bytes::from_static(
+                b"data: {\"model\":\"real\",\"x\":1}\n",
+            ))),
             Ok(Frame::data(Bytes::from_static(b"\ndata: {\"mod"))),
-            Ok(Frame::data(Bytes::from_static(b"el\":\"real\",\"x\":2}\n\n"))),
+            Ok(Frame::data(Bytes::from_static(
+                b"el\":\"real\",\"x\":2}\n\n",
+            ))),
         ];
         let body = StreamBody::new(tokio_stream::iter(chunks));
         let mut stream = SseRewrite::new(body, Bytes::from_static(b"alias"), 0);
@@ -422,7 +484,9 @@ mod tests {
         // buffer must be empty (consumed data is released, not retained).
         let mut payload = Vec::new();
         for i in 0..100 {
-            payload.extend_from_slice(format!("data: {{\"model\":\"real\",\"i\":{i}}}\n\n").as_bytes());
+            payload.extend_from_slice(
+                format!("data: {{\"model\":\"real\",\"i\":{i}}}\n\n").as_bytes(),
+            );
         }
         let chunks: Vec<Result<Frame<Bytes>, Infallible>> =
             vec![Ok(Frame::data(Bytes::from(payload)))];
@@ -433,7 +497,10 @@ mod tests {
         while let Some(item) = stream.next().await {
             item.unwrap();
             count += 1;
-            assert!(stream.buf.capacity() <= 64 * 1024, "buffer should not accumulate");
+            assert!(
+                stream.buf.capacity() <= 64 * 1024,
+                "buffer should not accumulate"
+            );
         }
         assert_eq!(count, 100);
         assert!(stream.buf.is_empty());
@@ -482,6 +549,7 @@ mod tests {
             served_model: served_model.into(),
             api_key: None,
             params,
+            fortify: None,
         }
     }
 

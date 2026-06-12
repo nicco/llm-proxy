@@ -1,4 +1,5 @@
 mod config;
+mod fortify;
 mod forward;
 
 use axum::{
@@ -9,7 +10,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -55,8 +56,8 @@ async fn handle(
         state.max_body,
         state.header_timeout,
     )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
 /// Strip trailing path from a URL, keeping only scheme + host + port.
@@ -87,12 +88,19 @@ async fn infer_model_from_body(
     let model_name = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
         .and_then(|v| v.get("model")?.as_str().map(|s| s.to_string()))
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "model not found in body".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "model not found in body".to_string(),
+            )
+        })?;
 
-    let model_cfg = state
-        .config
-        .find(&model_name)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown model: {model_name}")))?;
+    let model_cfg = state.config.find(&model_name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("unknown model: {model_name}"),
+        )
+    })?;
 
     let mut upstream_url = format!("{}{}", strip_url_path(&model_cfg.target), path);
     if let Some(q) = parts.uri.query() {
@@ -110,13 +118,21 @@ async fn infer_model_from_body(
         state.max_body,
         state.header_timeout,
     )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))
 }
 
 /// Fetch vLLM model list and return only proxy-configured models that match.
-async fn list_models(State(state): State<Arc<AppState>>) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let target = state.config.models.first().map(|m| &m.target).cloned().unwrap_or_default();
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let target = state
+        .config
+        .models
+        .first()
+        .map(|m| &m.target)
+        .cloned()
+        .unwrap_or_default();
     let upstream_url = format!("{}/models", target.trim_end_matches('/'));
 
     let req = Request::builder()
@@ -128,24 +144,33 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Result<axum::Json<se
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("upstream /v1/models failed: {e}");
-            return Err((StatusCode::BAD_GATEWAY, format!("upstream models fetch failed: {e}")));
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("upstream models fetch failed: {e}"),
+            ));
         }
     };
 
-    let collected = resp.into_body().collect().await
+    let collected = resp
+        .into_body()
+        .collect()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     let body = collected.to_bytes();
 
     let upstream_models: Vec<String> = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| v.get("data")?.as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id")?.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        }))
+        .and_then(|v| {
+            v.get("data")?.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id")?.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+        })
         .unwrap_or_default();
 
-    let upstream_set: std::collections::HashSet<&str> = upstream_models.iter().map(|s| s.as_str()).collect();
+    let upstream_set: std::collections::HashSet<&str> =
+        upstream_models.iter().map(|s| s.as_str()).collect();
 
     let models: Vec<serde_json::Value> = state
         .config
@@ -162,7 +187,9 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Result<axum::Json<se
         })
         .collect();
 
-    Ok(axum::Json(serde_json::json!({"object": "list", "data": models})))
+    Ok(axum::Json(
+        serde_json::json!({"object": "list", "data": models}),
+    ))
 }
 
 async fn health() -> &'static str {
@@ -178,9 +205,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = config::AppConfig::from_file(
-        &config::AppConfig::default_path().to_string_lossy(),
-    )?;
+    let config =
+        config::AppConfig::from_file(&config::AppConfig::default_path().to_string_lossy())?;
 
     if config.models.is_empty() {
         tracing::warn!("config loaded with zero models — all requests will 404");
@@ -200,7 +226,8 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
-    let header_timeout = (header_timeout > 0).then(|| std::time::Duration::from_secs(header_timeout));
+    let header_timeout =
+        (header_timeout > 0).then(|| std::time::Duration::from_secs(header_timeout));
 
     // Shared HTTP client with keep-alive connection pooling.  The pool limit
     // only caps *idle* sockets per host — concurrent requests beyond it open
@@ -215,7 +242,12 @@ async fn main() -> anyhow::Result<()> {
             .pool_max_idle_per_host(32)
             .build(connector);
 
-    let state = Arc::new(AppState { config, client, max_body, header_timeout });
+    let state = Arc::new(AppState {
+        config,
+        client,
+        max_body,
+        header_timeout,
+    });
 
     let bind: std::net::SocketAddr = std::env::var("LLM_PROXY_BIND")
         .unwrap_or_else(|_| "0.0.0.0:7878".into())

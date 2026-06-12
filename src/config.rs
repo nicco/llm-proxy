@@ -27,6 +27,49 @@ pub struct ModelConfig {
     /// The proxy does not interpret these fields.
     #[serde(default)]
     pub params: HashMap<String, serde_json::Value>,
+    /// Tool-call fortification (forge-style validate/rescue/retry).
+    /// `None` means pure passthrough — the proxy never parses responses.
+    #[serde(default)]
+    pub fortify: Option<FortifyConfig>,
+}
+
+/// How fortified requests interact with streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FortifyMode {
+    /// Stream upstream; forward prose live, hold from the first sign of a
+    /// tool call, fix the held tail at end of stream.  Retry only happens
+    /// when nothing has been forwarded yet.
+    Hold,
+    /// Force `stream:false` upstream, validate the complete response, and
+    /// synthesize SSE for streaming clients.  Retry always possible.
+    Buffer,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FortifyConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_mode")]
+    pub mode: FortifyMode,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_true")]
+    pub rescue: bool,
+    #[serde(default)]
+    pub inject_respond_tool: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_mode() -> FortifyMode {
+    FortifyMode::Hold
+}
+
+fn default_max_retries() -> u32 {
+    3
 }
 
 impl AppConfig {
@@ -75,8 +118,13 @@ impl AppConfig {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate process-global env vars — they race
+    /// when the test harness runs them on parallel threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_default_path_returns_homedir_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear any env var that tests may have set
         env::remove_var("LLM_PROXY_CONFIG");
         let orig_home = env::var("HOME").ok();
@@ -92,6 +140,7 @@ mod tests {
 
     #[test]
     fn test_default_path_respects_env_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Clear HOME to avoid interference, and clean up the env var
         env::remove_var("HOME");
         env::remove_var("LLM_PROXY_CONFIG");
@@ -112,6 +161,7 @@ mod tests {
                     served_model: "gpt-4".into(),
                     api_key: None,
                     params: HashMap::new(),
+                    fortify: None,
                 },
                 ModelConfig {
                     name: "thinking".into(),
@@ -119,6 +169,7 @@ mod tests {
                     served_model: "claude".into(),
                     api_key: None,
                     params: HashMap::new(),
+                    fortify: None,
                 },
             ],
             model_index: HashMap::new(),
@@ -139,6 +190,7 @@ mod tests {
                     served_model: "first".into(),
                     api_key: None,
                     params: HashMap::new(),
+                    fortify: None,
                 },
                 ModelConfig {
                     name: "dup".into(),
@@ -146,6 +198,7 @@ mod tests {
                     served_model: "second".into(),
                     api_key: None,
                     params: HashMap::new(),
+                    fortify: None,
                 },
             ],
             model_index: HashMap::new(),
@@ -187,6 +240,49 @@ mod tests {
         }"#;
         let model: ModelConfig = serde_json::from_str(json).unwrap();
         assert_eq!(model.api_key, Some("sk-test-key".to_string()));
+    }
+
+    #[test]
+    fn test_model_config_fortify_defaults() {
+        let json = r#"{
+            "name": "test",
+            "target": "http://localhost:8000",
+            "served_model": "model-x",
+            "fortify": {}
+        }"#;
+        let model: ModelConfig = serde_json::from_str(json).unwrap();
+        let f = model.fortify.unwrap();
+        assert!(f.enabled);
+        assert_eq!(f.mode, FortifyMode::Hold);
+        assert_eq!(f.max_retries, 3);
+        assert!(f.rescue);
+        assert!(!f.inject_respond_tool);
+    }
+
+    #[test]
+    fn test_model_config_fortify_buffer_mode() {
+        let json = r#"{
+            "name": "test",
+            "target": "http://localhost:8000",
+            "served_model": "model-x",
+            "fortify": {"mode": "buffer", "max_retries": 1, "inject_respond_tool": true}
+        }"#;
+        let model: ModelConfig = serde_json::from_str(json).unwrap();
+        let f = model.fortify.unwrap();
+        assert_eq!(f.mode, FortifyMode::Buffer);
+        assert_eq!(f.max_retries, 1);
+        assert!(f.inject_respond_tool);
+    }
+
+    #[test]
+    fn test_model_config_no_fortify_is_none() {
+        let json = r#"{
+            "name": "test",
+            "target": "http://localhost:8000",
+            "served_model": "model-x"
+        }"#;
+        let model: ModelConfig = serde_json::from_str(json).unwrap();
+        assert!(model.fortify.is_none());
     }
 
     #[test]

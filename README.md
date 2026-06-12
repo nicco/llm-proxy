@@ -71,6 +71,66 @@ For each request the proxy:
 
 Streaming responses are forwarded in real-time with model name rewriting applied to every `data:` line. No intermediate buffering.
 
+## Tool-call fortification (forge-style)
+
+Optional per-model reliability layer for tool calling, ported from
+[forge](https://github.com/antoinezambelli/forge): tool calls in responses
+are **validated** against the request's `tools` array, malformed calls are
+**rescue-parsed** out of text (JSON code fences, `[TOOL_CALLS]`, Qwen-coder
+XML, `name[ARGS]{…}`), and invalid calls trigger **retries** with corrective
+messages appended to the conversation.
+
+```json
+{
+  "name": "qwen3.6-agent",
+  "target": "http://host.docker.internal:8000/v1",
+  "served_model": "Qwen3.6-35B-A3B",
+  "fortify": {
+    "enabled": true,
+    "mode": "hold",
+    "max_retries": 3,
+    "rescue": true,
+    "inject_respond_tool": false
+  }
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `true` | Master switch (the whole block is optional — omit `fortify` for pure passthrough) |
+| `mode` | `"hold"` | `"hold"` streams prose live and buffers only tool calls; `"buffer"` forces non-streaming upstream and synthesizes SSE — retry always possible |
+| `max_retries` | `3` | Upstream re-asks after an invalid tool call before degrading to the last response as-is |
+| `rescue` | `true` | Attempt to parse tool calls out of malformed text responses |
+| `inject_respond_tool` | `false` | Append a synthetic `respond` tool so the model always tool-calls; respond calls are converted back to plain text |
+
+Fortification only engages for `POST …/chat/completions` requests carrying a
+non-empty `tools` array (and `n` ≤ 1). Everything else — including all
+requests to models without a `fortify` block — stays on the zero-parse
+forwarding path.
+
+### How streaming is preserved (`mode: "hold"`)
+
+The upstream stays in streaming mode. Prose is forwarded live, a few deltas
+behind the live edge; the moment the response turns into a tool call (native
+`tool_calls` deltas or a malformed-call text marker), forwarding stops and
+the rest is buffered, validated, and fixed at end of stream. `<think>` blocks
+stream live. Retrying (re-asking the model) is physically possible only while
+nothing has been forwarded yet:
+
+| Response shape | Client experience | Retry? | Rescue? |
+|---|---|---|---|
+| Native tool call from the first delta | held → validated tool call | ✅ | ✅ |
+| Malformed tool call at start of content | held → rescued tool call | ✅ | ✅ |
+| Pure prose | streams live | n/a | n/a |
+| Prose, then tool call | prose live → pause → fixed tool call | ❌ | ✅ |
+| Tool call after streamed think/reasoning | reasoning live → then as above | ❌ | ✅ |
+
+`mode: "buffer"` trades live prose for retry coverage on every row. In both
+modes a response that can't be fixed is forwarded as-is — fortification never
+turns a deliverable response into an error. Retries are sent non-streaming;
+streaming clients then receive a synthesized SSE stream of the final
+validated response, so client code works unmodified either way.
+
 ## Running
 
 ### Docker Compose (recommended)
@@ -155,11 +215,12 @@ llm-proxy :7878        ← Rust / Axum
   |  Params injection
   |  SSE streaming
   |  Model name rewriting
+  |  Tool-call fortification (opt-in)
   v
 upstream (vLLM, etc.) :8000
 ```
 
-- **Zero JSON parses on the response path** — SSE and non-streaming responses are forwarded as raw bytes with only the model name rewritten.
+- **Zero JSON parses on the response path** — SSE and non-streaming responses are forwarded as raw bytes with only the model name rewritten. (Exception: fortified tool-calling requests, which parse responses by design.)
 - **CORS enabled** — `Origin: *`, `GET` + `POST` allowed.
 - **Static config** — the config file is read once at startup. Restart the container to pick up changes.
 
